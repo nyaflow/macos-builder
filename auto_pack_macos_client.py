@@ -24,12 +24,16 @@ import zipfile
 
 DEFAULT_TIMEOUT = 30.0
 UPLOAD_CHUNK_SIZE = 10 * 1024 * 1024
+UPLOAD_RETRIES = 3
+UPLOAD_RETRY_DELAY_SECONDS = 1.0
 SERVER_ENV = "BUILD_SERVER"
 TOKEN_ENV = "BUILD_TOKEN"
 SOURCE_ROUTE = "/source"
 LOG_ROUTE = "/logs"
 DIST_ROUTE = "/dist"
 SESSION_HEADER = "X-Build-Session"
+DIST_SIZE_HEADER = "X-Dist-Size"
+DIST_SHA256_HEADER = "X-Dist-SHA256"
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 WEBSOCKET_HEARTBEAT_INTERVAL = 20.0
 
@@ -390,34 +394,99 @@ def create_dist_archive(dist: Path, destination: Path) -> None:
             archive.write(path, Path("dist") / path.relative_to(dist))
 
 
-def upload_dist(server: str, token: str, archive: Path, timeout: float) -> None:
-    parsed = urlsplit(route_url(server, DIST_ROUTE))
-    connection_type = HTTPSConnection if parsed.scheme == "https" else HTTPConnection
-    connection = connection_type(parsed.hostname, parsed.port, timeout=timeout)
-    archive_size = archive.stat().st_size
-    sent_size = 0
-    try:
-        connection.putrequest("POST", parsed.path or DIST_ROUTE)
-        connection.putheader("Authorization", f"Bearer {token}")
-        connection.putheader("Content-Type", "application/zip")
-        connection.putheader("Content-Length", str(archive_size))
-        connection.endheaders()
-        with archive.open("rb") as file:
-            while chunk := file.read(UPLOAD_CHUNK_SIZE):
-                connection.send(chunk)
-                sent_size += len(chunk)
-        response = connection.getresponse()
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while chunk := file.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def uploaded_dist_parts(server: str, token: str, timeout: float) -> tuple[bool, set[tuple[int, int]]]:
+    request = Request(
+        route_url(server, DIST_ROUTE),
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        method="GET",
+    )
+    with urlopen(request, timeout=timeout) as response:
         detail = response.read(4096).decode("utf-8", errors="replace")
         if response.status != 200:
-            raise RuntimeError(f"dist 上传失败，HTTP {response.status}: {detail}")
-    except (HTTPException, OSError) as exc:
-        raise RuntimeError(
-            "dist 上传网络错误"
-            f"（已发送 {sent_size}/{archive_size} bytes，上传块 {UPLOAD_CHUNK_SIZE} bytes）: "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
-    finally:
-        connection.close()
+            raise RuntimeError(f"查询 dist 已上传分片失败，HTTP {response.status}: {detail}")
+    try:
+        payload = json.loads(detail)
+        parts = payload["parts"]
+        return bool(payload.get("complete")), {
+            (part["start"], part["end"])
+            for part in parts
+            if isinstance(part, dict) and isinstance(part.get("start"), int) and isinstance(part.get("end"), int)
+        }
+    except (json.JSONDecodeError, KeyError, TypeError):
+        raise RuntimeError(f"查询 dist 已上传分片响应无效: {detail}") from None
+
+
+def upload_dist(server: str, token: str, archive: Path, timeout: float) -> None:
+    """Use separately acknowledged requests to avoid per-request body limits."""
+
+    parsed = urlsplit(route_url(server, DIST_ROUTE))
+    connection_type = HTTPSConnection if parsed.scheme == "https" else HTTPConnection
+    archive_size = archive.stat().st_size
+    archive_sha256 = file_sha256(archive)
+    parts = [
+        (start, min(start + UPLOAD_CHUNK_SIZE, archive_size) - 1)
+        for start in range(0, archive_size, UPLOAD_CHUNK_SIZE)
+    ]
+    complete, completed = uploaded_dist_parts(server, token, timeout)
+    if complete:
+        return
+    for start, end in parts:
+        if (start, end) in completed:
+            continue
+        chunk_size = end - start + 1
+        for attempt in range(1, UPLOAD_RETRIES + 1):
+            connection = connection_type(parsed.hostname, parsed.port, timeout=timeout)
+            try:
+                connection.putrequest("POST", parsed.path or DIST_ROUTE)
+                connection.putheader("Authorization", f"Bearer {token}")
+                connection.putheader("Content-Type", "application/zip")
+                connection.putheader("Content-Length", str(chunk_size))
+                connection.putheader("Content-Range", f"bytes {start}-{end}/{archive_size}")
+                connection.putheader(DIST_SIZE_HEADER, str(archive_size))
+                connection.putheader(DIST_SHA256_HEADER, archive_sha256)
+                connection.endheaders()
+                with archive.open("rb") as file:
+                    file.seek(start)
+                    remaining = chunk_size
+                    while remaining:
+                        chunk = file.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise RuntimeError("读取 dist 上传分片时意外到达文件末尾")
+                        connection.send(chunk)
+                        remaining -= len(chunk)
+                response = connection.getresponse()
+                detail = response.read(4096).decode("utf-8", errors="replace")
+                if response.status not in (200, 201):
+                    raise RuntimeError(f"dist 分片上传失败，HTTP {response.status}: {detail}")
+                completed.add((start, end))
+                break
+            except (HTTPException, OSError, RuntimeError) as exc:
+                if attempt == UPLOAD_RETRIES:
+                    raise RuntimeError(
+                        "dist 分片上传失败"
+                        f"（分片 {start}-{end}/{archive_size}，已重试 {UPLOAD_RETRIES} 次）: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
+                time.sleep(UPLOAD_RETRY_DELAY_SECONDS * attempt)
+                try:
+                    complete, server_parts = uploaded_dist_parts(server, token, timeout)
+                    if complete:
+                        return
+                    completed.update(server_parts)
+                    if (start, end) in completed:
+                        break
+                except (HTTPException, OSError, RuntimeError):
+                    pass
+            finally:
+                connection.close()
 
 
 def run_build(work_dir: Path, log_client: WebSocketLogClient) -> tuple[int, list[str]]:
