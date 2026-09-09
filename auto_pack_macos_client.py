@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from threading import Lock, Thread
+from threading import Event, Lock, Thread, current_thread
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 import zipfile
@@ -31,6 +31,7 @@ LOG_ROUTE = "/logs"
 DIST_ROUTE = "/dist"
 SESSION_HEADER = "X-Build-Session"
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WEBSOCKET_HEARTBEAT_INTERVAL = 20.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -142,6 +143,10 @@ class WebSocketLogClient:
         self._timeout = timeout
         self._socket = None
         self._send_lock = Lock()
+        self._stop_event = Event()
+        self._reader_thread: Thread | None = None
+        self._heartbeat_thread: Thread | None = None
+        self._disconnect_error: BaseException | None = None
 
     def connect(self) -> None:
         if self._url.hostname is None:
@@ -199,7 +204,12 @@ class WebSocketLogClient:
                 or headers.get("sec-websocket-accept") != expected_accept
             ):
                 raise RuntimeError(f"日志 WebSocket 连接失败，HTTP {status}")
+            connection.settimeout(None)
             self._socket = connection
+            self._reader_thread = Thread(target=self._read_server_frames, name="macos-log-websocket-reader", daemon=True)
+            self._heartbeat_thread = Thread(target=self._send_heartbeats, name="macos-log-websocket-heartbeat", daemon=True)
+            self._reader_thread.start()
+            self._heartbeat_thread.start()
         except Exception:
             connection.close()
             raise
@@ -210,8 +220,74 @@ class WebSocketLogClient:
         ).encode("utf-8")
         with self._send_lock:
             if self._socket is None:
+                if self._disconnect_error is not None:
+                    raise ConnectionError(f"日志 WebSocket 已断开: {self._disconnect_error}")
                 raise ConnectionError("日志 WebSocket 未连接")
             self._send_frame(0x01, payload)
+
+    def _read_websocket_bytes(self, size: int) -> bytes:
+        if self._socket is None:
+            raise ConnectionError("日志 WebSocket 未连接")
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining:
+            chunk = self._socket.recv(remaining)
+            if not chunk:
+                raise ConnectionError("日志 WebSocket 被服务器关闭")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _read_server_frame(self) -> tuple[bool, int, bytes]:
+        header = self._read_websocket_bytes(2)
+        final = bool(header[0] & 0x80)
+        opcode = header[0] & 0x0F
+        if header[0] & 0x70 or header[1] & 0x80:
+            raise ValueError("服务端 WebSocket 帧无效")
+        length = header[1] & 0x7F
+        if length == 126:
+            length = int.from_bytes(self._read_websocket_bytes(2), "big")
+        elif length == 127:
+            length_bytes = self._read_websocket_bytes(8)
+            if length_bytes[0] & 0x80:
+                raise ValueError("服务端 WebSocket payload 长度无效")
+            length = int.from_bytes(length_bytes, "big")
+        if opcode >= 0x08 and (not final or length > 125):
+            raise ValueError("服务端 WebSocket 控制帧无效")
+        return final, opcode, self._read_websocket_bytes(length)
+
+    def _read_server_frames(self) -> None:
+        """Drain server frames, replying to pings so both directions remain usable."""
+
+        try:
+            while not self._stop_event.is_set():
+                final, opcode, payload = self._read_server_frame()
+                if opcode == 0x08:
+                    if not self._stop_event.is_set():
+                        with self._send_lock:
+                            self._send_frame(0x08, payload)
+                    raise ConnectionError("日志 WebSocket 收到服务器关闭帧")
+                if opcode == 0x09:
+                    with self._send_lock:
+                        self._send_frame(0x0A, payload)
+                elif opcode not in (0x0A, 0x01, 0x02, 0x00) or not final:
+                    raise ValueError("服务端 WebSocket 帧类型无效")
+        except (OSError, ValueError, ConnectionError) as exc:
+            if not self._stop_event.is_set():
+                self._disconnect_error = exc
+                self._stop_event.set()
+
+    def _send_heartbeats(self) -> None:
+        """Application-level traffic prevents idle HTTP/NAT/SSH tunnel expiry."""
+
+        while not self._stop_event.wait(WEBSOCKET_HEARTBEAT_INTERVAL):
+            try:
+                with self._send_lock:
+                    self._send_frame(0x09, b"log-keepalive")
+            except (OSError, ConnectionError) as exc:
+                self._disconnect_error = exc
+                self._stop_event.set()
+                return
 
     def _send_frame(self, opcode: int, payload: bytes) -> None:
         if self._socket is None:
@@ -233,14 +309,22 @@ class WebSocketLogClient:
         self._socket.sendall(header + mask + masked_payload)
 
     def close(self) -> None:
+        self._stop_event.set()
         with self._send_lock:
             if self._socket is not None:
                 try:
                     self._send_frame(0x08, (1000).to_bytes(2, "big"))
                 except OSError:
                     pass
+                try:
+                    self._socket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 self._socket.close()
             self._socket = None
+        for thread in (self._reader_thread, self._heartbeat_thread):
+            if thread is not None and thread is not current_thread():
+                thread.join(timeout=1)
 
 
 def report_status(log_client: WebSocketLogClient, message: str) -> bool:
