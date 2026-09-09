@@ -2,29 +2,35 @@
 from __future__ import annotations
 
 import argparse
-from http.client import HTTPConnection, HTTPSConnection
+import base64
+import hashlib
+from http.client import HTTPConnection, HTTPSConnection, HTTPException
 import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import socket
+import ssl
 import stat
 import subprocess
 import sys
 import tempfile
 import time
-from threading import Thread
+from threading import Lock, Thread
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 import zipfile
 
 
 DEFAULT_TIMEOUT = 30.0
+UPLOAD_CHUNK_SIZE = 10 * 1024 * 1024
 SERVER_ENV = "BUILD_SERVER"
 TOKEN_ENV = "BUILD_TOKEN"
 SOURCE_ROUTE = "/source"
 LOG_ROUTE = "/logs"
 DIST_ROUTE = "/dist"
 SESSION_HEADER = "X-Build-Session"
+WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 def parse_args() -> argparse.Namespace:
@@ -127,48 +133,157 @@ def extract_source(archive: Path, root: Path) -> None:
                 destination.chmod(mode)
 
 
-def post_log(server: str, token: str, stream: str, line: str, timeout: float) -> None:
-    body = json.dumps(
-        {"stream": stream, "line": line}, ensure_ascii=False, separators=(",", ":")
-    ).encode("utf-8")
-    request = Request(
-        route_url(server, LOG_ROUTE),
-        data=body,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json; charset=utf-8",
-            "Content-Length": str(len(body)),
-        },
-        method="POST",
-    )
-    with urlopen(request, timeout=timeout) as response:
-        if response.status != 200:
-            detail = response.read(4096).decode("utf-8", errors="replace")
-            raise RuntimeError(f"日志上传失败，HTTP {response.status}: {detail}")
+class WebSocketLogClient:
+    """使用标准库发送带掩码的 WebSocket 文本帧。"""
+
+    def __init__(self, server: str, token: str, timeout: float) -> None:
+        self._url = urlsplit(route_url(server, LOG_ROUTE))
+        self._token = token
+        self._timeout = timeout
+        self._socket = None
+        self._send_lock = Lock()
+
+    def connect(self) -> None:
+        if self._url.hostname is None:
+            raise ValueError("日志 WebSocket URL 缺少主机名")
+        port = self._url.port or (443 if self._url.scheme == "https" else 80)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        target = self._url.path or LOG_ROUTE
+        if self._url.query:
+            target += f"?{self._url.query}"
+        host = self._url.hostname
+        host_header = host if self._url.port is None else f"{host}:{port}"
+        connection = socket.create_connection((host, port), timeout=self._timeout)
+        try:
+            if self._url.scheme == "https":
+                connection = ssl.create_default_context().wrap_socket(connection, server_hostname=host)
+            request = (
+                f"GET {target} HTTP/1.1\r\n"
+                f"Host: {host_header}\r\n"
+                f"Authorization: Bearer {self._token}\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                "\r\n"
+            ).encode("ascii")
+            connection.sendall(request)
+            response_lines: list[bytes] = []
+            while True:
+                line = bytearray()
+                while not line.endswith(b"\r\n"):
+                    byte = connection.recv(1)
+                    if not byte:
+                        raise ConnectionError("日志 WebSocket 握手连接被服务器关闭")
+                    line.extend(byte)
+                if line == b"\r\n":
+                    break
+                response_lines.append(bytes(line[:-2]))
+            if not response_lines:
+                raise RuntimeError("日志 WebSocket 握手响应为空")
+            try:
+                _, status, _ = response_lines[0].decode("ascii").split(" ", 2)
+                headers = {
+                    name.strip().lower(): value.strip()
+                    for line in response_lines[1:]
+                    for name, value in [line.decode("iso-8859-1").split(":", 1)]
+                }
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise RuntimeError("日志 WebSocket 握手响应无效") from exc
+            expected_accept = base64.b64encode(
+                hashlib.sha1((key + WEBSOCKET_GUID).encode("ascii")).digest()
+            ).decode("ascii")
+            if (
+                status != "101"
+                or headers.get("upgrade", "").lower() != "websocket"
+                or headers.get("sec-websocket-accept") != expected_accept
+            ):
+                raise RuntimeError(f"日志 WebSocket 连接失败，HTTP {status}")
+            self._socket = connection
+        except Exception:
+            connection.close()
+            raise
+
+    def send_log(self, stream: str, line: str) -> None:
+        payload = json.dumps(
+            {"stream": stream, "line": line}, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        with self._send_lock:
+            if self._socket is None:
+                raise ConnectionError("日志 WebSocket 未连接")
+            self._send_frame(0x01, payload)
+
+    def _send_frame(self, opcode: int, payload: bytes) -> None:
+        if self._socket is None:
+            raise ConnectionError("日志 WebSocket 未连接")
+        length = len(payload)
+        header = bytearray((0x80 | opcode,))
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 2**16:
+            header.extend((0x80 | 126,))
+            header.extend(length.to_bytes(2, "big"))
+        else:
+            header.extend((0x80 | 127,))
+            header.extend(length.to_bytes(8, "big"))
+        mask = os.urandom(4)
+        masked_payload = bytearray(payload)
+        for index, value in enumerate(masked_payload):
+            masked_payload[index] = value ^ mask[index % len(mask)]
+        self._socket.sendall(header + mask + masked_payload)
+
+    def close(self) -> None:
+        with self._send_lock:
+            if self._socket is not None:
+                try:
+                    self._send_frame(0x08, (1000).to_bytes(2, "big"))
+                except OSError:
+                    pass
+                self._socket.close()
+            self._socket = None
 
 
-def report_status(server: str, token: str, message: str, timeout: float) -> None:
+def report_status(log_client: WebSocketLogClient, message: str) -> bool:
     """Send client status to the server without echoing it locally."""
 
     try:
-        post_log(server, token, "stdout", message, timeout)
-    except Exception as exc:
+        log_client.send_log("stdout", message)
+        return True
+    except Exception:
         # Before this point the client deliberately has no local output. If the
         # status channel itself fails, retain a minimal diagnostic so a stalled
         # remote build is not completely silent on the client machine.
         print("⚠️ 无法将客户端状态上传到 server。", file=sys.stderr, flush=True)
+        return False
 
 
-def forward_output(
-    pipe, stream: str, server: str, token: str, timeout: float, errors: list[str]
-) -> None:
+def report_client_failure(
+    log_client: WebSocketLogClient,
+    phase: str,
+    exc: BaseException,
+    secrets_to_redact: tuple[str, ...],
+) -> bool:
+    """Report a useful, token-safe client exception through the build log."""
+
+    detail = str(exc) or "无异常说明"
+    for secret in secrets_to_redact:
+        if secret:
+            detail = detail.replace(secret, "***")
+    detail = detail.replace("\x00", "\\0")[:4096]
+    return report_status(
+        log_client,
+        f"❌ macOS 客户端异常（阶段: {phase}）: {type(exc).__name__}: {detail}",
+    )
+
+
+def forward_output(pipe, stream: str, log_client: WebSocketLogClient, errors: list[str]) -> None:
     """Forward one child stream without echoing it on the client."""
 
     try:
         for raw_line in iter(pipe.readline, b""):
             line = raw_line.decode("utf-8", errors="replace")
             try:
-                post_log(server, token, stream, line, timeout)
+                log_client.send_log(stream, line)
             except Exception as exc:  # Keep draining the child process on network errors.
                 errors.append(f"{stream}: {exc}")
         pipe.close()
@@ -195,24 +310,33 @@ def upload_dist(server: str, token: str, archive: Path, timeout: float) -> None:
     parsed = urlsplit(route_url(server, DIST_ROUTE))
     connection_type = HTTPSConnection if parsed.scheme == "https" else HTTPConnection
     connection = connection_type(parsed.hostname, parsed.port, timeout=timeout)
+    archive_size = archive.stat().st_size
+    sent_size = 0
     try:
         connection.putrequest("POST", parsed.path or DIST_ROUTE)
         connection.putheader("Authorization", f"Bearer {token}")
         connection.putheader("Content-Type", "application/zip")
-        connection.putheader("Content-Length", str(archive.stat().st_size))
+        connection.putheader("Content-Length", str(archive_size))
         connection.endheaders()
         with archive.open("rb") as file:
-            while chunk := file.read(1024 * 1024):
+            while chunk := file.read(UPLOAD_CHUNK_SIZE):
                 connection.send(chunk)
+                sent_size += len(chunk)
         response = connection.getresponse()
         detail = response.read(4096).decode("utf-8", errors="replace")
         if response.status != 200:
             raise RuntimeError(f"dist 上传失败，HTTP {response.status}: {detail}")
+    except (HTTPException, OSError) as exc:
+        raise RuntimeError(
+            "dist 上传网络错误"
+            f"（已发送 {sent_size}/{archive_size} bytes，上传块 {UPLOAD_CHUNK_SIZE} bytes）: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     finally:
         connection.close()
 
 
-def run_build(work_dir: Path, server: str, token: str, timeout: float) -> tuple[int, list[str]]:
+def run_build(work_dir: Path, log_client: WebSocketLogClient) -> tuple[int, list[str]]:
     pack_script = work_dir / "pack_macos.sh"
     config = work_dir / "pack-input.json"
     if not pack_script.is_file() or not config.is_file():
@@ -231,12 +355,12 @@ def run_build(work_dir: Path, server: str, token: str, timeout: float) -> tuple[
     threads = [
         Thread(
             target=forward_output,
-            args=(process.stdout, "stdout", server, token, timeout, upload_errors),
+            args=(process.stdout, "stdout", log_client, upload_errors),
             name="macos-build-stdout",
         ),
         Thread(
             target=forward_output,
-            args=(process.stderr, "stderr", server, token, timeout, upload_errors),
+            args=(process.stderr, "stderr", log_client, upload_errors),
             name="macos-build-stderr",
         ),
     ]
@@ -266,6 +390,10 @@ def main() -> int:
     work_dir.mkdir(parents=True, exist_ok=True)
 
     archive_root: Path | None = None
+    log_client: WebSocketLogClient | None = None
+    session_token: str | None = None
+    phase = "下载源码"
+    build_completed = False
     try:
         # Keep the downloaded archive outside the extraction root. This also
         # prevents a ZIP member from replacing the archive while it is open.
@@ -273,39 +401,53 @@ def main() -> int:
         archive_root.mkdir(parents=True, exist_ok=False)
         source_archive = archive_root / "src.zip"
         session_token = download_source(server, token, source_archive, args.timeout)
-        report_status(server, session_token, "==> macOS 客户端已下载源码，开始准备构建。", args.timeout)
+        log_client = WebSocketLogClient(server, session_token, args.timeout)
+        phase = "连接日志通道"
+        log_client.connect()
+        report_status(log_client, "==> macOS 客户端已下载源码，开始准备构建。")
+        phase = "解压源码"
         extract_source(source_archive, work_dir)
         shutil.rmtree(archive_root)
 
-        report_status(server, session_token, "==> macOS 客户端开始执行 pack_macos.sh。", args.timeout)
-        return_code, upload_errors = run_build(work_dir, server, session_token, args.timeout)
+        report_status(log_client, "==> macOS 客户端开始执行 pack_macos.sh。")
+        phase = "执行 macOS 打包"
+        return_code, upload_errors = run_build(work_dir, log_client)
         if upload_errors:
             for error in sorted(set(upload_errors)):
-                report_status(server, session_token, f"⚠️ 日志上传异常: {error}", args.timeout)
+                report_status(log_client, f"⚠️ 日志上传异常: {error}")
         if return_code != 0:
-            report_status(server, session_token, f"❌ macOS 打包失败，退出码: {return_code}", args.timeout)
+            report_status(log_client, f"❌ macOS 打包失败，退出码: {return_code}")
             return return_code
         if upload_errors:
             raise RuntimeError("构建完成，但部分日志未能上传")
 
+        build_completed = True
         dist_archive = work_dir / "dist-upload.zip"
+        phase = "创建 dist 上传压缩包"
         create_dist_archive(work_dir / "dist", dist_archive)
-        report_status(server, session_token, "==> macOS 打包完成，开始上传 dist 产物。", args.timeout)
+        report_status(log_client, "==> macOS 打包完成，开始上传 dist 产物。")
+        phase = "上传 dist 产物"
         upload_dist(server, session_token, dist_archive, args.timeout)
-        report_status(server, session_token, "==> macOS 构建和产物上传完成。", args.timeout)
+        report_status(log_client, "==> macOS 构建和产物上传完成。")
         return 0
+    except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as exc:
+        if log_client is not None:
+            failure_phase = f"打包完成后：{phase}" if build_completed else phase
+            report_client_failure(log_client, failure_phase, exc, (server, token, session_token or ""))
+        raise
     finally:
         if archive_root is not None:
             shutil.rmtree(archive_root, ignore_errors=True)
         if temporary_directory is not None:
             if args.keep_workdir:
-                # The session token may not exist when download/extraction fails.
-                if "session_token" in locals():
-                    report_status(server, session_token, f"==> 已保留工作目录: {temporary_directory}", args.timeout)
+                if log_client is not None:
+                    report_status(log_client, f"==> 已保留工作目录: {temporary_directory}")
                 else:
                     print(f"⚠️ 已保留工作目录: {temporary_directory}", file=sys.stderr, flush=True)
             else:
                 shutil.rmtree(temporary_directory, ignore_errors=True)
+        if log_client is not None:
+            log_client.close()
 
 
 if __name__ == "__main__":

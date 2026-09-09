@@ -61,12 +61,16 @@ jobs:
 
       - name: 执行 macOS 打包脚本
         timeout-minutes: 90
-        env:
-          BUILD_SERVER: ${{ inputs.build_server }}
-          BUILD_TOKEN: ${{ inputs.build_token }}
         run: |
+          BUILD_SERVER="$(
+            python3 -c 'import json,os; print(json.load(open(os.environ["GITHUB_EVENT_PATH"]))["inputs"]["build_server"], end="")'
+          )"
+          BUILD_TOKEN="$(
+            python3 -c 'import json,os; print(json.load(open(os.environ["GITHUB_EVENT_PATH"]))["inputs"]["build_token"], end="")'
+          )"
           echo "::add-mask::$BUILD_SERVER"
           echo "::add-mask::$BUILD_TOKEN"
+          export BUILD_SERVER BUILD_TOKEN
           python3 -m venv .venv
           source .venv/bin/activate
           python -m pip install Pillow==12.3.0
